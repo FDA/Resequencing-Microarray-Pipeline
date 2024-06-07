@@ -1,0 +1,284 @@
+#! /usr/bin/perl -w
+use strict;
+use File::Path qw/make_path/;
+use POSIX qw(log10);
+use List::MoreUtils 'firstidx';
+
+my $BLAST ="/home/duncan/Public/10-26-2023_backup/openboxbio/db/ncbi/nt";
+my $TILECONTFILE = "/home/duncan/Public/10-26-2023_backup/openboxbio/data/bbp/tile_contaminating_sequences"; # this is the mask file with coordinates for each tile to be masked. Additional tiles can be added in the format <tile_id>, <mask_position_start>, <mask_position_stop>.
+my $ScientificNamesFile = "/home/duncan/Public/10-26-2023_backup/openboxbio/data/bbp/ScientificNamesList"; #this is the file that contains the list of less specific scientific names
+$ENV{'BLASTDB'} = '/home/duncan/Public/10-26-2023_backup/openboxbio/db/ncbi/';
+
+###########################################################################################################################
+#create a timestamp for execution start time. This timestamp will be added to the final file names as a unique identifier.#
+###########################################################################################################################
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
+$year+=1900;
+$mon++;
+my $date= join "\/",($mon,$mday,$year);
+my $time= join ":", ($hour,$min,$sec);
+my $timestamp= join ", ", ($date,$time);
+my $timestamp_label= join "_", ($year,$mon,$mday,$hour,$min,$sec); # add label to directory name.
+
+#########################################################################################################################################
+#bbp_i2o_2 takes a single argument- the input file name. It parses the fasta file and stores it in a hash- %seq; hash key= tile name.    #
+#########################################################################################################################################
+
+open (F, "$ARGV[0]") || die "cannot open file to read:$!";
+
+my %aseq; # a hash of arrays to store the sequence; hash key= tile name.
+my $key;
+while(<F>){
+    chomp;
+    if(/^>/){
+       my @defline= split/:/;
+       $defline[0]=~ s/>//;
+       $key= $defline[0];
+       next;
+    }
+
+    push @{$aseq{$key}},uc($_);
+}
+close(F);
+
+my %seq; #the hash that stores the concatenated tile sequences
+foreach my $k (keys %aseq){
+  $seq{$k}= join "", @{$aseq{$k}};
+  #print ">",$k,"\n",$seq{$k},"\n"; #test code to ensure that tile sequences are stored correctly in the %seq hash.
+}
+my %tile_ids= map { $_ => 1 } keys %seq;
+open(F,"$TILECONTFILE");
+my @tilecontinfo = <F>;
+chomp(@tilecontinfo);
+my $head = shift(@tilecontinfo);
+
+foreach my $t (@tilecontinfo){
+  my @tilepos= split /\s+/, $t;
+  my $id = $tilepos[0];
+  my $start = $tilepos[1];
+  my $end = $tilepos[2];
+  if(exists($tile_ids{$id})){
+    my @original_sequence = split "", $seq{$id};
+    for (my $i = $start-1; $i < $end; $i++){
+      $original_sequence[$i] = 'N';
+    }
+    my $corrected_seq = join "", @original_sequence;
+    $seq{$id} = $corrected_seq;
+  }
+}
+
+#exit;
+
+
+######################################################################################################
+#Calculate the C3 score for each tile and store it in the %c3 hash; hash key=tile name.
+#Count the number of Ns in the tile sequence. Print tile sequences with C3 >= 20.00 in a separate file
+#for BLASTing.
+######################################################################################################
+my $SAMPLE= $ARGV[0];
+$SAMPLE=~ s/.txt//;
+my $indices = rindex($SAMPLE,"/");
+my $STRAIN= substr $SAMPLE, $indices+1, length($SAMPLE)-$indices;
+print "$SAMPLE \n";
+
+#my $STRAIN=$SAMPLE;
+my %c3; #hash to store C3 scores;
+my %ncount; #hash to store N counts.
+my $blastInputFile= $SAMPLE."\.blast\.in\.fst"; #query file for BLAST
+my $blastOutFile= $SAMPLE."\.blast\.report"; #formatted BLAST report
+my $blastHTMLFile= $SAMPLE."\.blast\.html"; #detailed blast report in the html format
+my $rejectedNamesFile= $SAMPLE."\.Unrecognized.Names";#File containing species rejected for unknown names
+
+foreach my $k (keys %seq){
+      my $seq= $seq{$k};
+      $ncount{$k}= ()= $seq=~ /N/g;
+      my @runs= split/N+/, $seq;
+      my $c3= "";
+      foreach my $r (@runs){
+          if(length($r)>=3){
+              $c3.=$r;
+            }
+          }
+          $c3{$k}= sprintf "%0.2f", 100*length($c3)/length($seq);
+}
+#exit;
+my $count_of_tiles_with_C3_gte_20 = 0;
+open (W,">$blastInputFile");
+foreach my $k (sort {$c3{$b} <=> $c3{$a} } keys %c3){
+  if (($c3{$k} >= 20.00) && !($k =~ /^CTRL/)){
+    print W ">".$k,"\n",$seq{$k},"\n";                     # Tiles are printed in descending C3 score order for BlASTing.
+    $count_of_tiles_with_C3_gte_20++;
+  }
+}
+close(W);
+open (W,">$blastOutFile");
+open (R,">$rejectedNamesFile");
+#exit;
+##################################################################################################################
+#Test if there are any tiles with C3 score gte 20. If not print an error message in the output file and quit.
+#Otherwise proceed to BLAST all tiles with C3 >= 20 against the nt database.
+##################################################################################################################
+if ($count_of_tiles_with_C3_gte_20 ==0){
+  print W "No tiles with C3 score greater than 20. Possibly no pathogen present in sample or a case of bad sample preparation.\n";
+  close(W);
+  exit;
+} else {
+#Blast each tile against the nt database.
+
+print "Blasting Sequences...\n";
+open(NTBLASTRUN, "/home/duncan/Public/10-26-2023_backup/openboxbio/code/ncbi-blast/bin/blastn -task blastn -query $blastInputFile  -db $BLAST -num_threads 40 -max_target_seqs 2000 -outfmt \"6 qseqid bitscore evalue sscinames sacc staxids\"| "); #open a filehandle to a blast run.
+my @ntblastop= <NTBLASTRUN>;
+chomp(@ntblastop);
+open(F,"$ScientificNamesFile");
+my @SciNameArr = <F>;
+chomp(@SciNameArr);
+print W "Sample Id:", $SAMPLE,"\n\n";
+print W "Run started at:", $timestamp,"\n\n";
+print W "QC Tile","\t\t","C3 Score","\n";
+print W "CTRL-NAC","\t   ",$c3{'CTRL-NAC'},"\n";
+print W "CTRL-TIM","\t   ",$c3{'CTRL-TIM'},"\n\n";
+print W "Tile ID","\t","C3 Score","\t","Bit-score","\t","E-value","\t","Accession number","\t","Scientific Name","\n";
+######################################################################
+#exit; ###EXIT ADDED HERE TO TEST SEGMENTATION FAULT ISSUES WITH BLAST.
+#######################################################################
+my %ScoreHash;
+my %BitHash;
+my %EHash;
+my %tileHash;
+my %rejectHash;
+foreach my $op (@ntblastop){#Searches for DENV tiles containing the taxid 12637 and skips them
+  print $op, "\n";
+  my @result= split/\t/, $op;
+  my $tile= $result[0];
+  if (index($tile, 'DENV') != -1){
+    if ($result[5]=="12637"){
+      if (exists $rejectHash{$result[3]}==0){
+        $rejectHash{$result[3]}=1;
+        next
+      }else{
+        $rejectHash{$result[3]}=$rejectHash{$result[3]}+1;
+      next
+      }
+    }
+  }
+  my $flag=0;
+  foreach my $l (@SciNameArr){  #Correct overly specific names
+    my @ChangeNamesArr=split/>/, $l;
+    my $name=$result[3];
+    if (index(lc($name), lc($ChangeNamesArr[0]))!=-1) {
+      $result[3]=$ChangeNamesArr[1];
+      $flag=1;
+      last
+    }
+  }
+
+  if ((exists $tileHash{$tile})==0){#Restricts printing of a single tile to 3 repetitions
+    $tileHash{$tile}=1;
+  }
+  if ($tileHash{$tile}<=3){#If a certain tile has printed less than three times
+    if ($flag==0){#If no corresponding name was found, skips that pathogen and returns it in rejected names
+      if (exists $rejectHash{$result[3]}==0){
+        $rejectHash{$result[3]}=1;
+        next
+      }else{
+        $rejectHash{$result[3]}=$rejectHash{$result[3]}+1;
+        next
+      }
+    }
+    print W $tile,"\t",$c3{$tile},"\t", $result[1],"\t",$result[2],"\t",$result[4],"\t",$result[3],"\t","\n";
+    $tileHash{$tile}=$tileHash{$tile}+1;
+  }else{
+      next
+  }
+  ### Cummulatively Add scores
+  if (exists $ScoreHash{$result[3]}){ #Add new scores to previous for existing pathogen
+      my $CumC3Score=$ScoreHash{$result[3]}+$c3{$tile};
+      my $CumBitScore=$BitHash{$result[3]}+$result[1];
+      my $CumEScore=$EHash{$result[3]};
+      if ($result[2]<=1e-200){
+          $CumEScore=$EHash{$result[3]}+200;#if log too small to read, make 200 (changeable value)
+      } else {
+          $CumEScore=$EHash{$result[3]}-(log10($result[2]));#Calculate the log base 10
+      }
+      $ScoreHash{$result[3]}=$CumC3Score;
+      $BitHash{$result[3]}=$CumBitScore;
+      $EHash{$result[3]}=$CumEScore;
+  } else { #Create initial entry of scores for pathogen
+      $ScoreHash{$result[3]}=$c3{$tile};
+      $BitHash{$result[3]}=$result[1];
+      if ($result[2]<=1e-200){
+        $EHash{$result[3]}=200;#if log too small to read, make 200 (changeable value)
+      } else {
+        $EHash{$result[3]}=-(log10($result[2]));
+      }
+  }
+}
+close(W);
+#exit;
+
+system("/home/duncan/Public/10-26-2023_backup/openboxbio/code/ncbi-blast/bin/blastn -task blastn -query $blastInputFile  -db $BLAST -num_threads 40 -html -out $blastHTMLFile");
+print "Blast Complete\n";
+#########Ranking system... using 3 scores for each, must sort from best to wort
+print "Calculating Pathogen Ranks...\n";
+my $IDreport=$SAMPLE."\.ID\.report";#To list top 3 candidates for ID of pathogen
+open (W,">$IDreport");
+print W "Sample Id:", $SAMPLE,"\n\n";
+print W "Rank","\t","Scientific Name","\t \t \t","C3 Score","\t","Bit-score","\t","E-value","\t","\n";
+my %RanksHash;
+my $Rankcount=1;
+foreach my $key (sort{$ScoreHash{$b}<=>$ScoreHash{$a}}keys %ScoreHash){ #Calculate Ranks of C3
+  $RanksHash{$key}=$Rankcount;
+  $Rankcount=$Rankcount+1;
+}
+$Rankcount=1;
+foreach my $key (sort{$BitHash{$b}<=>$BitHash{$a}}keys %BitHash){#Calculate Ranks of Bit
+  $RanksHash{$key}=$RanksHash{$key}+$Rankcount;
+  $Rankcount=$Rankcount+1;
+}
+$Rankcount=1;
+foreach my $key (sort{$EHash{$b}<=>$EHash{$a}}keys %EHash){#Calculate Ranks of E
+  $RanksHash{$key}=$RanksHash{$key}+$Rankcount;
+  $Rankcount=$Rankcount+1;
+}
+$Rankcount=1;
+foreach my $key (sort{$RanksHash{$a}<=>$RanksHash{$b}}keys %RanksHash){#Sorts Hash from best score to worst and reports corresponding Pathogen rank
+  #if ($Rankcount<6){ Conditional to suppress outputs to top 5
+    my $CReported = $ScoreHash{$key};
+    my $BReported= $BitHash{$key};
+    my $EReported=$EHash{$key};
+    print "$key is ranked $Rankcount\n";
+    print W $Rankcount,"\t", $key,"\t \t",$CReported,"\t \t",$BReported,"\t \t",$EReported,"\t","\n";
+    $Rankcount=$Rankcount+1;
+  #}
+}
+print W "\n \n \nMade Possible by Luke Ternes";
+print R "Skipped Pathogen\t\tInstances\n";
+foreach my $key (sort{$rejectHash{$b}<=>$rejectHash{$a}}keys %rejectHash){
+  print R $key,"\t",$rejectHash{$key},"\n";
+}
+}
+close(W);
+close(F);
+close(R);
+print "Calculations Complete\n";
+
+######################################################################################################################################################################################################################
+#This code block creates a directory with the same name as the sample; All result files and the input_tile_files_list
+#and the input sample file are stored in the directory. All results folders are stored in /home/Duncan.Lab/bbp_pipeline_output.
+######################################################################################################################################################################################################################
+my $results_dir= "\/home\/duncan\/Public\/10-26-2023_backup\/bbp_pipeline_output";
+
+my $RESULTS= $results_dir."/".$STRAIN."_".$timestamp_label; #assign a name to the results directory. Naming convention: <Sample Name>_<timestamp of run start time>
+make_path("$RESULTS");
+
+my $FilePattern= $SAMPLE."\.\*";
+my @list_fst= glob("$FilePattern");
+
+#system("mv $ARGV[0] $RESULTS");
+foreach my $l (@list_fst){
+  system("mv $l $RESULTS");
+
+}
+print "Analysis Complete\n";
+
+exit;
